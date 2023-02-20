@@ -1,0 +1,170 @@
+<?php
+// S. AShby, 01/02/2023 Created
+// Simple bridge to use the NissanCOnnect PHP class from Guillaume Boudreau: https://github.com/gboudreau/nissan-connect-php
+// imports to a single meter to measure % SOC
+
+echo "NissanConnect->Domo started\n";
+
+require_once 'NissanConnect.class.php';
+require "../phpMQTT-master/phpMQTT.php";
+
+$server = "localhost";     // change if necessary
+$port = 1883;                     // change if necessary
+$username = "";                   // set your username
+$password = "";                   // set your password
+$client_id = "NissanConnect-subscriber"; // make sure this is unique for connecting to sever - you could use uniqid()
+
+// config
+$username = "xxx";
+$password = "xxx";
+$domo_idx = 3560;
+
+// debug
+$debug=false;
+
+// include Syslog class for remote syslog feature
+require "../Syslog-master/Syslog.php";
+Syslog::$hostname = "localhost";
+Syslog::$facility = LOG_DAEMON;
+Syslog::$hostToLog = "nissanconnect-domo";
+
+function report($msg, $level = LOG_INFO, $cmp = "nissanconnect-domo") {
+	global $debug;
+	if($debug) echo "nissanconnect-domo:".$level.":".$msg."\n";
+    Syslog::send($msg, $level, $cmp);
+}
+
+$mqtt = new phpMQTT($server, $port, $client_id);
+$lasttelemetry = time();
+$telemetry_sec = 600;
+$lastbattery = 0;
+$battery_sec = 3600;
+
+// infinite loop here
+$ct = 0;
+while (true) {
+	if(!$mqtt->connect(true, NULL, $username, $password)) {
+		report('NissanConnect->Domo cannot connect to MQTT - retrying in 10 sec',LOG_ERROR);
+		sleep(10);
+	} else {
+		report('NissanConnect->Domo connected to queue:'.$server.':'.$port,LOG_NOTICE);
+
+		$topics['nissanconnect/cmd'] = array("qos" => 0, "function" => "procmsg");
+		$mqtt->subscribe($topics, 0);
+		// post first status
+		$mqtt->publish('nissanconnect/cmd','status',0);
+
+		while($mqtt->proc()){
+			$now=time();
+			if($lastbattery < $now-$battery_sec) {
+				$mqtt->publish('nissanconnect/cmd','get_battery',0);
+				$lastbattery = $now;
+			}
+			// do telemetry for process
+			if($lasttelemetry < $now-$telemetry_sec) {
+				$tele = 'NissanConnect->Domo telemetry; timeouts in last period: '.$ct;
+				$ct = 0;
+				report($tele,LOG_INFO);
+				$lasttelemetry = $now;
+			}
+			sleep(1); // proc() is non-blocking so dont hog the CPU!
+		}
+
+		// proc() returned false - reconnect
+		report('NissanConnect->Domo lost connection - retrying',LOG_NOTICE);
+		$mqtt->close();
+	}
+}
+
+$nissanConnect = null;
+
+function procmsg($topic, $msg, $retain){
+	global $mqtt;
+	global $debug;
+	global $ct;
+	global $telemetry_sec;
+	global $nissanConnect;
+	global $username;
+	global $password;
+	global $domo_idx;
+	$now = time();
+	$id=null;
+	// skip retain flag msgs (LWT usually)
+	if($retain)
+		return;
+	// process by topic
+	if($debug) echo 'msg from:'.$topic."\n";
+	if ($topic=='nissanconnect/cmd') {
+		if($debug) echo "cmd:".$msg."\n";
+		if((empty($msg))|| $msg=='status') {
+			$data = new stdClass();
+			$data->cmd = "status";
+			$data->now = $now;
+			$data->error_count = $ct;
+			$msg = JSON_encode($data);
+			$mqtt->publish('nissanconnect/status',$msg,0);
+			if($debug) echo 'reply:'.$msg."\n";
+			return;
+		}
+		if($msg=='config') {
+			$data = new stdClass();
+			$data->cmd = "config";
+			$data->debug = $debug;
+			$data->telemetry_sec = $telemetry_sec;
+			$msg = JSON_encode($data);
+			$mqtt->publish('nissanconnect/status',$msg,0);
+			if($debug) echo 'reply:'.$msg."\n";
+			return;
+		}
+		if($msg=='debug') {
+			$debug = !$debug; // toggle and report debug state
+			$data = new stdClass();
+			$data->cmd = "debug";
+			$data->debug = $debug;
+			$msg = JSON_encode($data);
+			$mqtt->publish('nissanconnect/status',$msg,0);
+			if($debug) echo 'reply:'.$msg."\n";
+			return;
+		}
+ 		if($msg=='get_battery') {
+			$svalue = null;
+			try {
+				if($nissanConnect == null) {
+					$nissanConnect = new NissanConnect($username, $password, 'Europe/London', NissanConnect::COUNTRY_EU, NissanConnect::ENCRYPTION_OPTION_OPENSSL);
+					$nissanConnect->debug = $debug;
+					$nissanConnect->maxWaitTime = 290;
+				}
+				$result = $nissanConnect->getStatus();
+				$svalue = $result->SOC;
+				// construct Domoticz update and send it
+				$data = new stdClass();
+				$data->idx = $domo_idx;
+				$data->nvalue = 0;
+				$data->svalue = $svalue;
+				$msg = JSON_encode($data);
+				$mqtt->publish('domoticz/in',$msg,0);
+				report('sending: '.$msg,LOG_DEBUG);
+			} catch (Exception $ex) {
+				$nissanConnect = null;
+				$ct+=1;
+				$err =  'Nissan Connect error: ' . $ex->getMessage();
+				$svalue = $err;
+				report($err,LOG_ERROR);
+			}
+
+			$data = new stdClass();
+			$data->cmd = "get_battery";
+			$data->result = $svalue;
+			$msg = JSON_encode($data);
+			$mqtt->publish('nissanconnect/status',$msg,0);
+			if($debug) echo 'reply:'.$msg."\n";
+		}
+	}
+	else {
+		// Unknown message source - ignore
+		return;
+	}
+}
+
+
+?>
