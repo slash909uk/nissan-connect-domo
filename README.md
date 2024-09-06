@@ -1,4 +1,5 @@
 # nissan-connect-domo
+ARCHIVED repo moved to: https://codeberg.org/slash909uk/nissan-connect-domo
 PHP script to pull Nissan Leaf battery status from Nissan Connect cloud API and report to Domoticz/MQTT
 Add your Nissan Connect credentials and rename the script from nissan-connect-domo.php.example to just .php to use it.
 
